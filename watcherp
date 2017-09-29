@@ -1,0 +1,303 @@
+#!/usr/bin/env bash
+#
+# The MIT License (MIT)
+#
+# Copyright (c) 2017 cytopia
+#
+
+############################################################
+# Settings
+############################################################
+
+# Be strict
+set -e
+set -u
+set -o pipefail
+
+# Required to loop over newlines instead of spaces
+IFS=$'\n'
+
+
+
+############################################################
+# Variables
+############################################################
+
+# Versioning
+MY_NAME="watcherp"
+MY_DATE="2017-09-17"
+MY_URL="https://github.com/devilbox/watcherp"
+MY_AUTHOR="cytopia <cytopia@everythingcli.org>"
+MY_GPGKEY="0xA02C56F0"
+MY_VERSION="0.1"
+MY_LICENSE="MIT"
+
+# Default settings
+INTERVAL=1
+VERBOSE=0
+IGNORE_PORTS=
+CMD_ADD=
+CMD_DEL=
+CMD_TRIGGER=
+
+# Do not create subshell when comparing ports
+# This is useful when running this script by supervisord
+# as it would otherwise see too many process spawns.
+WITHOUT_SUBSHELL=1
+
+
+
+############################################################
+# Functions
+############################################################
+
+function print_help() {
+	printf "Usage: %s %s\n" "${MY_NAME}" "-a <cmd> -d <cmd> [-t <cmd> -i <int> -p <ports> -v]"
+	printf "       %s %s\n" "${MY_NAME}" "--help"
+	printf "       %s %s\n" "${MY_NAME}" "--version"
+	printf "\n"
+	printf "%s\n" "${MY_NAME} will look for listening port changes (added and removed listening ports)"
+	printf "and will execute specified commands or shell scripts (-a, -d) depending on the event.\n"
+	printf "Once all events have happened during one round (-i), a trigger command can be executed (-t).\n"
+	printf "Note, the trigger command will only be execute when at least one add or delete command has succeeded with exit code 0."
+	printf "\n"
+	printf "\nRequired arguments:\n"
+	printf "  -a <cmd>      %s\n" "Command to execute when a port was added."
+	printf "                %s\n" "You can also append the following placeholders to your command string:"
+	printf "                %s\n" "%p The port that was added."
+	printf "                %s\n" "Example: -a \"script.sh -f %p -c %p -a %p\""
+	printf "  -d <cmd>      %s\n" "Command to execute when a port was removed."
+	printf "                %s\n" "You can also append the following placeholders to your command string:"
+	printf "                %s\n" "%p The port that was removed."
+	printf "                %s\n" "Example: -b \"script.sh -f %p -c %n -a %p\""
+	printf "\nOptional arguments:\n"
+	printf "  -p <ports>    %s\n" "Comma separated list of ports to ignore."
+	printf "  -t <cmd>      %s\n" "Command to execute after all ports have been added or removed during one round."
+	printf "                %s\n" "No argument will be appended."
+	printf "  -i <int>      %s\n" "Specify the interval in seconds for how often to look for port changes."
+	printf "  -v            %s\n" "Verbose output."
+	printf "\nMisc arguments:\n"
+	printf "  --help        %s\n" "Show this help screen."
+	printf "  --version     %s\n" "Show version information."
+}
+
+function print_version() {
+	printf "Name:    %s\n" "${MY_NAME}"
+	printf "Version: %s (%s)\n" "${MY_VERSION}" "${MY_DATE}"
+	printf "Author:  %s (%s)\n" "${MY_AUTHOR}" "${MY_GPGKEY}"
+	printf "License: %s\n" "${MY_LICENSE}"
+	printf "URL:     %s\n" "${MY_URL}"
+}
+
+function get_open_ports() {
+	# comma separated list of ports to ignore
+	local ignores="${1}"
+	ports="$( netstat -tlnw | grep LISTEN | awk '{print $4}' | sed 's/^.*://' | sort -u )"
+	for port in ${ports}; do
+		# Check if current port is present in ignore ports
+		regex="(^\s*${port}\$)|(^${port}\s*,)|(,\s*${port}\s*,)|(,\s*${port}\s*\$)"
+		if ! echo "${ignores}" | grep -Eq "${regex}"; then
+			echo "${port}"
+		fi
+	done
+}
+
+function action() {
+	local port="${1}"       # Port to work on
+	local action="${2}"     # Add/Del command to execute
+	local info="${3}"       # Output text (ADD or DEL) for verbose mode
+	local verbose="${4}"    # Verbose?
+
+	# Fill with placeholder values
+	action="${action//%p/${port}}"
+
+	if eval "${action}"; then
+		if [ "${verbose}" -gt "0" ]; then
+			printf "%s: [%s] [OK]  %s succeeded: %s\n" "${MY_NAME}" "$( date '+%Y-%m-%d %H:%M:%S' )" "${info}" "${port}"
+		fi
+		return 0
+	else
+		if [ "${verbose}" -gt "0" ]; then
+			printf "%s: [%s] [ERR] %s failed:    %s\n" "${MY_NAME}" "$( date '+%Y-%m-%d %H:%M:%S' )" "${info}" "${port}"
+		fi
+		return 1
+	fi
+}
+
+function trigger() {
+	local action="${1}"    # Trigger command to run
+	local changes="${2}"   # Only run trigger when changes == 1
+	local verbose="${3}"   # Verbose?
+
+	# Only run trigger when command has been specified (not empty)
+	if [ -n "${action}" ]; then
+		if [ "${changes}" -eq "1" ]; then
+			if  eval "${action}"; then
+				if [ "${verbose}" -gt "0" ]; then
+					printf "%s: [%s] [OK]  %s succeeded: %s\n" "${MY_NAME}" "$( date '+%Y-%m-%d %H:%M:%S' )" "TRIGGER" "${action}"
+				fi
+				return 0
+			else
+				if [ "${verbose}" -gt "0" ]; then
+					printf "%s: [%s] [ERR] %s failed:    %s\n" "${MY_NAME}" "$( date '+%Y-%m-%d %H:%M:%S' )" "TRIGGER" "${action}"
+				fi
+				# Also return 0 here in order to not abort the loop
+				return 0
+			fi
+		fi
+	fi
+}
+
+
+
+############################################################
+# Read command line arguments
+############################################################
+
+while [ $# -gt 0  ]; do
+	case "${1}" in
+		-p)
+			shift
+			IGNORE_PORTS="${1}"
+			;;
+		-a)
+			shift
+			if [ "${1:0:1}" = "-" ]; then
+				>&2 echo "Specified add command cannot start with '-': '${1}'."
+				exit 1
+			fi
+			CMD_ADD="${1}"
+			;;
+		-d)
+			shift
+			if [ "${1:0:1}" = "-" ]; then
+				>&2 echo "Specified del command cannot start with '-': '${1}'."
+				exit 1
+			fi
+			CMD_DEL="${1}"
+			;;
+		-t)
+			shift
+			if [ "${1:0:1}" = "-" ]; then
+				>&2 echo "Specified trigger command cannot start with '-': '${1}'."
+				exit 1
+			fi
+			CMD_TRIGGER="${1}"
+			;;
+		-i)
+			shift
+			if ! echo "${1}" | grep -Eq '^[1-9][0-9]*$'; then
+				>&2 echo "Specified interval with -i is not a valid integer > 0: '${1}'."
+				exit 1
+			fi
+			INTERVAL="${1}"
+			;;
+		-v)
+			VERBOSE="1"
+			;;
+		--help)
+			print_help
+			exit 0
+			;;
+		--version)
+			print_version
+			exit 0
+			;;
+		*)
+			echo "Invalid argument: ${1}"
+			echo "Type '${MY_NAME} --help' for available options."
+			exit 1
+			;;
+	esac
+	shift
+done
+
+# Make sure required arguments are set
+if ! command -v netstat > /dev/null 2>&1; then
+	>&2 echo "Error: ${MY_NAME} requires netstat, but it is not installed."
+	exit 1
+fi
+if [ -z "${CMD_ADD}" ]; then
+	>&2 echo "Error: -a is required. Type --help for more information."
+	exit 1
+fi
+if [ -z "${CMD_DEL}" ]; then
+	>&2 echo "Error: -d is required. Type --help for more information."
+	exit 1
+fi
+
+
+############################################################
+# Main entrypoint
+############################################################
+
+# Log startup
+if [ "${VERBOSE}" -gt "0" ]; then
+	printf "%s: [%s] Starting daemon.\n" "${MY_NAME}" "$( date '+%Y-%m-%d %H:%M:%S' )"
+fi
+
+
+CHANGES=0
+ALL_PORTS="$( get_open_ports "${IGNORE_PORTS}" )"
+
+if [ "${WITHOUT_SUBSHELL}" -eq "1" ]; then
+	LFT_FILE="$( mktemp )"
+	RGT_FILE="$( mktemp )"
+fi
+
+# Initial add
+for d in ${ALL_PORTS}; do
+	# Only CHANGE if adding was successful
+	if action "${d}" "${CMD_ADD}" "ADD:" "${VERBOSE}"; then
+		CHANGES=1
+	fi
+done
+trigger "${CMD_TRIGGER}" "${CHANGES}" "${VERBOSE}"
+CHANGES=0
+
+
+###
+### Endless loop over changes
+###
+
+while true; do
+	# Get all ports
+	NEW_PORTS="$( get_open_ports "${IGNORE_PORTS}" )"
+
+	# Compare against previously read ports
+	if [ "${WITHOUT_SUBSHELL}" -eq "1" ]; then
+		echo "${ALL_PORTS}" > "${LFT_FILE}"
+		echo "${NEW_PORTS}" > "${RGT_FILE}"
+		ADD_PORTS="$( comm -13 "${LFT_FILE}" "${RGT_FILE}" )"
+		DEL_PORTS="$( comm -23 "${LFT_FILE}" "${RGT_FILE}" )"
+	else
+		ADD_PORTS="$( comm -13 <(echo "${ALL_PORTS}") <(echo "${NEW_PORTS}") )"
+		DEL_PORTS="$( comm -23 <(echo "${ALL_PORTS}") <(echo "${NEW_PORTS}") )"
+	fi
+
+	# Run ADD command
+	for d in $ADD_PORTS; do
+		if action "${d}" "${CMD_ADD}" "ADD" "${VERBOSE}"; then
+			CHANGES=1
+		fi
+	done
+
+	# Run DEL command
+	for d in $DEL_PORTS; do
+		if action "${d}" "${CMD_DEL}" "DEL" "${VERBOSE}"; then
+			CHANGES=1
+		fi
+	done
+
+	# Trigger if changes are present
+	trigger "${CMD_TRIGGER}" "${CHANGES}" "${VERBOSE}"
+
+	# Reset changes
+	CHANGES=0
+
+	# Update index to currently existing listening ports
+	ALL_PORTS="${NEW_PORTS}"
+
+	# Wait before restarting loop
+	sleep "${INTERVAL}"
+done
