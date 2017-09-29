@@ -6,6 +6,11 @@ watcherp will look for listening port changes (added and removed listening ports
 Once all events have happened during one round (`-i`), a trigger command can be executed (`-t`).
 Note, the trigger command will only be execute when at least one add or delete command has succeeded with exit code 0.
 
+---
+
+If you need the same functionality to monitor file system changes, check out **[watcherd](https://github.com/devilbox/watcherd)**.
+
+---
 
 ### Placeholders
 
