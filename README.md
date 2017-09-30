@@ -35,8 +35,8 @@ By using **[vhost_gen.py](https://github.com/devilbox/vhost-gen)** (which is cap
 # -p 80 Ignores the web server port itself.
 watcherp -v \
   -p 80 \
-  -a "vhost_gen.py -r %n:%p -n proxy.%p.example.com -s" \
-  -d "rm /etc/nginx/conf.d/%n.conf" \
+  -a "vhost_gen.py -r 'http://%n:%p' -l / -n 'proxy-%p.example.com' -s" \
+  -d "rm /etc/nginx/conf.d/proxy-%p.example.com.conf" \
   -t "nginx -s reload"
 ```
 
