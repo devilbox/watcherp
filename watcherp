@@ -25,7 +25,7 @@ IFS=$'\n'
 
 # Versioning
 MY_NAME="watcherp"
-MY_DATE="2017-09-29"
+MY_DATE="2017-09-30"
 MY_URL="https://github.com/devilbox/watcherp"
 MY_AUTHOR="cytopia <cytopia@everythingcli.org>"
 MY_GPGKEY="0xA02C56F0"
@@ -35,6 +35,7 @@ MY_LICENSE="MIT"
 # Default settings
 INTERVAL=1
 VERBOSE=0
+WATCHER="netstat"
 IGNORE_PORTS=
 CMD_ADD=
 CMD_DEL=
@@ -52,28 +53,34 @@ WITHOUT_SUBSHELL=1
 ############################################################
 
 function print_help() {
-	printf "Usage: %s %s\n" "${MY_NAME}" "-a <cmd> -d <cmd> [-t <cmd> -i <int> -p <ports> -v]"
+	printf "Usage: %s %s\n" "${MY_NAME}" "-a <cmd> -d <cmd> [-p <ports> -t <cmd> -w <str> -i <int> -v]"
 	printf "       %s %s\n" "${MY_NAME}" "--help"
 	printf "       %s %s\n" "${MY_NAME}" "--version"
 	printf "\n"
-	printf "%s\n" "${MY_NAME} will look for listening port changes (added and removed listening ports)"
+	printf "%s\n" "${MY_NAME} will look for port binding changes (added and removed port bindings)"
 	printf "and will execute specified commands or shell scripts (-a, -d) depending on the event.\n"
 	printf "Once all events have happened during one round (-i), a trigger command can be executed (-t).\n"
 	printf "Note, the trigger command will only be execute when at least one add or delete command has succeeded with exit code 0."
 	printf "\n"
 	printf "\nRequired arguments:\n"
-	printf "  -a <cmd>      %s\n" "Command to execute when a port was added."
+	printf "  -a <cmd>      %s\n" "Command to execute when a port started to bind on an address."
 	printf "                %s\n" "You can also append the following placeholders to your command string:"
-	printf "                %s\n" "%p The port that was added."
-	printf "                %s\n" "Example: -a \"script.sh -f %p -c %p -a %p\""
-	printf "  -d <cmd>      %s\n" "Command to execute when a port was removed."
+	printf "                %s\n" "%p The port that started binding."
+	printf "                %s\n" "%n The network address the port binded on."
+	printf "                %s\n" "Example: -a \"script.sh -f %p -c %n -a %p\""
+	printf "  -d <cmd>      %s\n" "Command to execute when a binding port was removed from an address."
 	printf "                %s\n" "You can also append the following placeholders to your command string:"
-	printf "                %s\n" "%p The port that was removed."
+	printf "                %s\n" "%p The port that started binding."
+	printf "                %s\n" "%n The network address the port binded on."
 	printf "                %s\n" "Example: -b \"script.sh -f %p -c %n -a %p\""
 	printf "\nOptional arguments:\n"
 	printf "  -p <ports>    %s\n" "Comma separated list of ports to ignore."
-	printf "  -t <cmd>      %s\n" "Command to execute after all ports have been added or removed during one round."
+	printf "  -t <cmd>      %s\n" "Command to execute after all binding ports have been added or removed during one round."
 	printf "                %s\n" "No argument will be appended."
+	printf "  -w <str>      %s\n" "The port binding watcher to use. Valid values are:"
+	printf "                %s\n" "'netstat': Uses netstat binary to watch for binding changes."
+	printf "                %s\n" "'ss':      Uses ss binary to watch for binding changes."
+	printf "                %s\n" "The default is to use 'netstat' as the watcher."
 	printf "  -i <int>      %s\n" "Specify the interval in seconds for how often to look for port changes."
 	printf "  -v            %s\n" "Verbose output."
 	printf "\nMisc arguments:\n"
@@ -89,36 +96,52 @@ function print_version() {
 	printf "URL:     %s\n" "${MY_URL}"
 }
 
-function get_open_ports() {
+function get_connections() {
 	# comma separated list of ports to ignore
 	local ignores="${1}"
-	ports="$( netstat -tlnw | grep LISTEN | awk '{print $4}' | sed 's/^.*://' | sort -u )"
-	for port in ${ports}; do
+	local connections=
+	local port=
+
+	# Note, this replaces tcp4/6 listen all to 0.0.0.0
+	if [ "${WATCHER}" = "netstat" ]; then
+		connections="$( netstat -tlnw | grep LISTEN | awk '{print $4}' | sed 's/::/0.0.0.0/g' | sort -u )"
+	elif [ "${WATCHER}" = "ss" ]; then
+		connections="$( ss -tlnw | grep LISTEN | awk '{print $5}' | sed 's/::/0.0.0.0/g' | sed 's/*/0.0.0.0/g' | sort -u )"
+	fi
+
+	for conn in ${connections}; do
+		# Remove the address part and extract the port
+		port="${conn##*:}"
 		# Check if current port is present in ignore ports
 		regex="(^\s*${port}\$)|(^${port}\s*,)|(,\s*${port}\s*,)|(,\s*${port}\s*\$)"
 		if ! echo "${ignores}" | grep -Eq "${regex}"; then
-			echo "${port}"
+			echo "${conn}"
 		fi
 	done
 }
 
 function action() {
-	local port="${1}"       # Port to work on
+	local conn="${1}"       # Connection (ADDR:PORT)
 	local action="${2}"     # Add/Del command to execute
 	local info="${3}"       # Output text (ADD or DEL) for verbose mode
 	local verbose="${4}"    # Verbose?
 
+	# Extract address and port
+	local port="${conn##*:}"
+	local addr="${conn//:*}"
+
 	# Fill with placeholder values
 	action="${action//%p/${port}}"
+	action="${action//%n/${addr}}"
 
 	if eval "${action}"; then
 		if [ "${verbose}" -gt "0" ]; then
-			printf "%s: [%s] [OK]  %s succeeded: %s\n" "${MY_NAME}" "$( date '+%Y-%m-%d %H:%M:%S' )" "${info}" "${port}"
+			printf "%s: [%s] [OK]  %s succeeded: %s\n" "${MY_NAME}" "$( date '+%Y-%m-%d %H:%M:%S' )" "${info}" "${conn}"
 		fi
 		return 0
 	else
 		if [ "${verbose}" -gt "0" ]; then
-			printf "%s: [%s] [ERR] %s failed:    %s\n" "${MY_NAME}" "$( date '+%Y-%m-%d %H:%M:%S' )" "${info}" "${port}"
+			printf "%s: [%s] [ERR] %s failed:    %s\n" "${MY_NAME}" "$( date '+%Y-%m-%d %H:%M:%S' )" "${info}" "${conn}"
 		fi
 		return 1
 	fi
@@ -184,6 +207,14 @@ while [ $# -gt 0  ]; do
 			fi
 			CMD_TRIGGER="${1}"
 			;;
+		-w)
+			shift
+			if [ "${1}" != "netstat" ] && [ "${1}" != "ss" ]; then
+				>&2 echo "Specified watcher with -w must either be 'netstat; or 'ss': '${1}'."
+				exit
+			fi
+			WATCHER="${1}"
+			;;
 		-i)
 			shift
 			if ! echo "${1}" | grep -Eq '^[1-9][0-9]*$'; then
@@ -213,9 +244,16 @@ while [ $# -gt 0  ]; do
 done
 
 # Make sure required arguments are set
-if ! command -v netstat > /dev/null 2>&1; then
-	>&2 echo "Error: ${MY_NAME} requires netstat, but it is not installed."
-	exit 1
+if [ "${WATCHER}" = "netstat" ]; then
+	if ! command -v netstat > /dev/null 2>&1; then
+		>&2 echo "Error: Selected watcher requires netstat, but it is not installed."
+		exit 1
+	fi
+elif [ "${WATCHER}" = "ss" ]; then
+	if ! command -v netstat > /dev/null 2>&1; then
+		>&2 echo "Error: Selected watcher requires ss, but it is not installed."
+		exit 1
+	fi
 fi
 if [ -z "${CMD_ADD}" ]; then
 	>&2 echo "Error: -a is required. Type --help for more information."
@@ -235,11 +273,12 @@ fi
 # Log startup
 if [ "${VERBOSE}" -gt "0" ]; then
 	printf "%s: [%s] Starting daemon.\n" "${MY_NAME}" "$( date '+%Y-%m-%d %H:%M:%S' )"
+	printf "%s: [%s] Using %s to watch for changes.\n" "${MY_NAME}" "$( date '+%Y-%m-%d %H:%M:%S' )" "${WATCHER}"
 fi
 
 
 CHANGES=0
-ALL_PORTS="$( get_open_ports "${IGNORE_PORTS}" )"
+ALL_CONNS="$( get_connections "${IGNORE_PORTS}" )"
 
 if [ "${WITHOUT_SUBSHELL}" -eq "1" ]; then
 	LFT_FILE="$( mktemp )"
@@ -247,7 +286,7 @@ if [ "${WITHOUT_SUBSHELL}" -eq "1" ]; then
 fi
 
 # Initial add
-for d in ${ALL_PORTS}; do
+for d in ${ALL_CONNS}; do
 	# Only CHANGE if adding was successful
 	if action "${d}" "${CMD_ADD}" "ADD:" "${VERBOSE}"; then
 		CHANGES=1
@@ -260,32 +299,31 @@ CHANGES=0
 ###
 ### Endless loop over changes
 ###
-
 while true; do
 	# Get all ports
-	NEW_PORTS="$( get_open_ports "${IGNORE_PORTS}" )"
+	NEW_CONNS="$( get_connections "${IGNORE_PORTS}" )"
 
 	# Compare against previously read ports
 	if [ "${WITHOUT_SUBSHELL}" -eq "1" ]; then
-		echo "${ALL_PORTS}" > "${LFT_FILE}"
-		echo "${NEW_PORTS}" > "${RGT_FILE}"
-		ADD_PORTS="$( comm -13 "${LFT_FILE}" "${RGT_FILE}" )"
-		DEL_PORTS="$( comm -23 "${LFT_FILE}" "${RGT_FILE}" )"
+		echo "${ALL_CONNS}" > "${LFT_FILE}"
+		echo "${NEW_CONNS}" > "${RGT_FILE}"
+		ADD_CONNS="$( comm -13 "${LFT_FILE}" "${RGT_FILE}" )"
+		DEL_CONNS="$( comm -23 "${LFT_FILE}" "${RGT_FILE}" )"
 	else
-		ADD_PORTS="$( comm -13 <(echo "${ALL_PORTS}") <(echo "${NEW_PORTS}") )"
-		DEL_PORTS="$( comm -23 <(echo "${ALL_PORTS}") <(echo "${NEW_PORTS}") )"
+		ADD_CONNS="$( comm -13 <(echo "${ALL_CONNS}") <(echo "${NEW_CONNS}") )"
+		DEL_CONNS="$( comm -23 <(echo "${ALL_CONNS}") <(echo "${NEW_CONNS}") )"
 	fi
 
 	# Run ADD command
-	for d in $ADD_PORTS; do
-		if action "${d}" "${CMD_ADD}" "ADD" "${VERBOSE}"; then
+	for d in $ADD_CONNS; do
+		if action "${d}" "${CMD_ADD}" "ADD:" "${VERBOSE}"; then
 			CHANGES=1
 		fi
 	done
 
 	# Run DEL command
-	for d in $DEL_PORTS; do
-		if action "${d}" "${CMD_DEL}" "DEL" "${VERBOSE}"; then
+	for d in $DEL_CONNS; do
+		if action "${d}" "${CMD_DEL}" "DEL:" "${VERBOSE}"; then
 			CHANGES=1
 		fi
 	done
@@ -297,7 +335,7 @@ while true; do
 	CHANGES=0
 
 	# Update index to currently existing listening ports
-	ALL_PORTS="${NEW_PORTS}"
+	ALL_CONNS="${NEW_CONNS}"
 
 	# Wait before restarting loop
 	sleep "${INTERVAL}"
